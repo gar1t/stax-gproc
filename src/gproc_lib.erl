@@ -20,7 +20,18 @@
 %% <p>For a detailed description, see gproc/doc/erlang07-wiger.pdf.</p>
 %% @end
 -module(gproc_lib).
--compile(export_all).
+
+-export([await/3,
+         do_set_counter_value/3,
+         do_set_value/3,
+         ensure_monitor/2,
+         insert_many/4,
+         insert_reg/4,
+         remove_many/4,
+         remove_reg/2,
+         update_aggr_counter/3,
+         update_counter/3,
+	 valid_opts/2]).
 
 -include("gproc.hrl").
 
@@ -31,7 +42,7 @@
 %% Pid around as payload as well. This is a bit redundant, but
 %% symmetric.
 %%
--spec insert_reg(key(), any(), pid(), scope()) -> boolean().
+-spec insert_reg(key(), any(), pid() | shared, scope()) -> boolean().
 
 insert_reg({T,_,Name} = K, Value, Pid, Scope) when T==a; T==n ->
     MaybeScan = fun() ->
@@ -42,7 +53,7 @@ insert_reg({T,_,Name} = K, Value, Pid, Scope) when T==a; T==n ->
                                 true
                         end
                 end,
-    Info = [{{K, T}, Pid, Value}, {{Pid,K},r}],
+    Info = [{{K, T}, Pid, Value}, {{Pid,K}, []}],
     case ets:insert_new(?TAB, Info) of
         true ->
             MaybeScan();
@@ -57,7 +68,7 @@ insert_reg({c,Scope,Ctr} = Key, Value, Pid, Scope) when Scope==l; Scope==g ->
     %% Non-unique keys; store Pid in the key part
     K = {Key, Pid},
     Kr = {Pid, Key},
-    Res = ets:insert_new(?TAB, [{K, Pid, Value}, {Kr,r}]),
+    Res = ets:insert_new(?TAB, [{K, Pid, Value}, {Kr, [{initial, Value}]}]),
     case Res of
         true ->
             update_aggr_counter(Scope, Ctr, Value);
@@ -65,11 +76,11 @@ insert_reg({c,Scope,Ctr} = Key, Value, Pid, Scope) when Scope==l; Scope==g ->
             ignore
     end,
     Res;
-insert_reg(Key, Value, Pid, _Scope) ->
+insert_reg({_,_,_} = Key, Value, Pid, _Scope) when is_pid(Pid) ->
     %% Non-unique keys; store Pid in the key part
     K = {Key, Pid},
     Kr = {Pid, Key},
-    ets:insert_new(?TAB, [{K, Pid, Value}, {Kr,r}]).
+    ets:insert_new(?TAB, [{K, Pid, Value}, {Kr, []}]).
 
 
 
@@ -82,7 +93,7 @@ insert_many(T, Scope, KVL, Pid) ->
         true ->
             RevObjs = mk_reg_rev_objs(T, Scope, Pid, KVL),
             ets:insert(?TAB, RevObjs),
-	    gproc_lib:ensure_monitor(Pid, Scope),
+            _ = gproc_lib:ensure_monitor(Pid, Scope),
             {true, Objs};
         false ->
             Existing = [{Obj, ets:lookup(?TAB, K)} || {K,_,_} = Obj <- Objs],
@@ -98,17 +109,17 @@ insert_many(T, Scope, KVL, Pid) ->
                 false ->
                     %% possibly waiters, but they are handled in next step
                     insert_objects(Existing),
-		    gproc_lib:ensure_monitor(Pid, Scope),
+                    _ = gproc_lib:ensure_monitor(Pid, Scope),
                     {true, Objs}
             end
     end.
 
 -spec insert_objects([{key(), pid(), any()}]) -> ok.
-     
+
 insert_objects(Objs) ->
     lists:foreach(
       fun({{{Id,_} = _K, Pid, V} = Obj, Existing}) ->
-              ets:insert(?TAB, [Obj, {{Pid, Id}, r}]),
+              ets:insert(?TAB, [Obj, {{Pid, Id}, []}]),
               case Existing of
                   [] -> ok;
                   [{_, Waiters}] ->
@@ -117,24 +128,30 @@ insert_objects(Objs) ->
       end, Objs).
 
 
-await({T,C,_} = Key, {Pid, Ref} = From) ->
-    Rev = {{Pid,Key}, r},
+await({T,C,_} = Key, WPid, {_Pid, Ref} = From) ->
+    Rev = {{WPid,Key}, []},
     case ets:lookup(?TAB, {Key,T}) of
         [{_, P, Value}] ->
             %% for symmetry, we always reply with Ref and then send a message
-            gen_server:reply(From, Ref),
-            Pid ! {gproc, Ref, registered, {Key, P, Value}},
-            noreply;
+            if C == g ->
+                    %% in the global case, we bundle the reply, since otherwise
+                    %% the messages can pass each other
+                    {reply, {Ref, {Key, P, Value}}};
+               true ->
+                    gen_server:reply(From, Ref),
+                    WPid ! {gproc, Ref, registered, {Key, P, Value}},
+                    noreply
+            end;
         [{K, Waiters}] ->
-            NewWaiters = [{Pid,Ref} | Waiters],
+            NewWaiters = [{WPid,Ref} | Waiters],
             W = {K, NewWaiters},
             ets:insert(?TAB, [W, Rev]),
-            gproc_lib:ensure_monitor(Pid,C),
+            _ = gproc_lib:ensure_monitor(WPid,C),
             {reply, Ref, [W,Rev]};
         [] ->
-            W = {{Key,T}, [{Pid,Ref}]},
+            W = {{Key,T}, [{WPid,Ref}]},
             ets:insert(?TAB, [W, Rev]),
-            gproc_lib:ensure_monitor(Pid,C),
+            _ = gproc_lib:ensure_monitor(WPid,C),
             {reply, Ref, [W,Rev]}
     end.
 
@@ -154,10 +171,14 @@ maybe_waiters(K, Pid, Value, T, Info) ->
 -spec notify_waiters([{pid(), reference()}], key(), pid(), any()) -> ok.
 
 notify_waiters(Waiters, K, Pid, V) ->
-    [begin
-         P ! {gproc, Ref, registered, {K, Pid, V}},
-         ets:delete(?TAB, {P, K}) 
-     end || {P, Ref} <- Waiters],
+    _ = [begin
+             P ! {gproc, Ref, registered, {K, Pid, V}},
+             case P of
+		 Pid -> ignore;
+		 _ ->
+		     ets:delete(?TAB, {P, K})
+	     end
+         end || {P, Ref} <- Waiters],
     ok.
 
 
@@ -176,9 +197,11 @@ mk_reg_objs(p = T, Scope, Pid, L) ->
               end, L).
 
 mk_reg_rev_objs(T, Scope, Pid, L) ->
-    [{{Pid,{T,Scope,K}},r} || {K,_} <- L].
+    [{{Pid,{T,Scope,K}}, []} || {K,_} <- L].
 
 
+ensure_monitor(shared, _) ->
+    ok;
 ensure_monitor(Pid, Scope) when Scope==g; Scope==l ->
     case node(Pid) == node() andalso ets:insert_new(?TAB, {{Pid, Scope}}) of
         false -> ok;
@@ -186,17 +209,28 @@ ensure_monitor(Pid, Scope) when Scope==g; Scope==l ->
     end.
 
 remove_reg(Key, Pid) ->
-    remove_reg_1(Key, Pid),
-    ets:delete(?TAB, {Pid,Key}).
+    Reg = remove_reg_1(Key, Pid),
+    ets:delete(?TAB, Rev = {Pid,Key}),
+    [Reg, Rev].
+
+remove_many(T, Scope, L, Pid) ->
+    lists:flatmap(fun(K) ->
+                          Key = {T, Scope, K},
+                          remove_reg(Key, Pid)
+                  end, L).
 
 remove_reg_1({c,_,_} = Key, Pid) ->
-    remove_counter_1(Key, ets:lookup_element(?TAB, {Key,Pid}, 3), Pid);
+    remove_counter_1(Key, ets:lookup_element(?TAB, Reg = {Key,Pid}, 3), Pid),
+    Reg;
 remove_reg_1({a,_,_} = Key, _Pid) ->
-    ets:delete(?TAB, {Key,a});
+    ets:delete(?TAB, Reg = {Key,a}),
+    Reg;
 remove_reg_1({n,_,_} = Key, _Pid) ->
-    ets:delete(?TAB, {Key,n});
+    ets:delete(?TAB, Reg = {Key,n}),
+    Reg;
 remove_reg_1({_,_,_} = Key, Pid) ->
-    ets:delete(?TAB, {Key, Pid}).
+    ets:delete(?TAB, Reg = {Key, Pid}),
+    Reg.
 
 remove_counter_1({c,C,N} = Key, Val, Pid) ->
     Res = ets:delete(?TAB, {Key, Pid}),
@@ -230,19 +264,46 @@ update_counter({c,l,Ctr} = Key, Incr, Pid) ->
 update_aggr_counter(C, N, Val) ->
     catch ets:update_counter(?TAB, {{a,C,N},a}, {3, Val}).
 
-%% cleanup_counter({c,g,N}=K, Pid, Acc) ->
-%%     remove_reg(K,Pid),
-%%     case ets:lookup(?TAB, {{a,g,N},a}) of
-%%         [Aggr] ->
-%%             [Aggr|Acc];
-%%         [] ->
-%%             Acc
-%%     end;
-%% cleanup_counter(K, Pid, Acc) ->
-%%     remove_reg(K,Pid),
-%%     Acc.
-
 scan_existing_counters(Ctxt, Name) ->
     Head = {{{c,Ctxt,Name},'_'},'_','$1'},
     Cs = ets:select(?TAB, [{Head, [], ['$1']}]),
     lists:sum(Cs).
+
+
+valid_opts(Type, Default) ->
+    Opts = get_app_env(Type, Default),
+    check_opts(Type, Opts).
+
+check_opts(Type, Opts) when is_list(Opts) ->
+    Check = check_option_f(Type),
+    lists:map(fun(X) ->
+		      case Check(X) of
+			  true -> X;
+			  false ->
+			      erlang:error({illegal_option, X}, [Type, Opts])
+		      end
+	      end, Opts);
+check_opts(Type, Other) ->
+    erlang:error(invalid_options, [Type, Other]).
+
+check_option_f(ets_options)    -> fun check_ets_option/1;
+check_option_f(server_options) -> fun check_server_option/1.
+
+check_ets_option({read_concurrency , B}) -> is_boolean(B);
+check_ets_option({write_concurrency, B}) -> is_boolean(B);
+check_ets_option(_) -> false.
+
+check_server_option({priority, P}) ->
+    %% Forbid setting priority to 'low' since that would
+    %% surely cause problems. Unsure about 'max'...
+    lists:member(P, [normal, high, max]);
+check_server_option(_) ->
+    %% assume it's a valid spawn option
+    true.
+
+get_app_env(Key, Default) ->
+    case application:get_env(Key) of
+	undefined       -> Default;
+	{ok, undefined} -> Default;
+	{ok, Value}     -> Value
+    end.

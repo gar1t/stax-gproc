@@ -1,1 +1,8 @@
-*.beam
+current_counterexample.eqc
+deps/
+ebin/
+.eunit/
+*~
+*/*~
+erl_crash.dump
+gproc_dist*@*

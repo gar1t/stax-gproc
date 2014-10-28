@@ -16,16 +16,40 @@
 %% @author Ulf Wiger <ulf.wiger@erlang-consulting.com>
 %%
 %% @doc Extended process registry
-%% <p>This module implements an extended process registry</p>
-%% <p>For a detailed description, see
-%% <a href="erlang07-wiger.pdf">erlang07-wiger.pdf</a>.</p>
+%% This module implements an extended process registry
 %%
-%% @type type()  = n | p | c | a. n = name; p = property; c = counter; 
+%% For a detailed description, see
+%% <a href="erlang07-wiger.pdf">erlang07-wiger.pdf</a>.
+%%
+%% <h2>Tuning Gproc performance</h2>
+%%
+%% Gproc relies on a central server and an ordered-set ets table.
+%% Effort is made to perform as much work as possible in the client without
+%% sacrificing consistency. A few things can be tuned by setting the following
+%% application environment variables in the top application of `gproc'
+%% (usually `gproc'):
+%%
+%% * `{ets_options, list()}' - Currently, the options `{write_concurrency, F}'
+%%   and `{read_concurrency, F}' are allowed. The default is
+%%   `[{write_concurrency, true}, {read_concurrency, true}]'
+%% * `{server_options, list()}' - These will be passed as spawn options when 
+%%   starting the `gproc' and `gproc_dist' servers. Default is `[]'. It is 
+%%   likely that `{priority, high | max}' and/or increasing `min_heap_size'
+%%   will improve performance.
+%%
+%% @end
+
+%% @type type()  = n | p | c | a. n = name; p = property; c = counter;
 %%                                a = aggregate_counter
 %% @type scope() = l | g. l = local registration; g = global registration
-%% @type context() = {scope(), type()} | type(). Local scope is the default
-%% @type sel_type() = n | p | c | a |
-%%                    names | props | counters | aggr_counters.
+%%
+%% @type reg_id() = {type(), scope(), any()}.
+%% @type unique_id() = {n | a, scope(), any()}.
+%%
+%% @type sel_scope() = scope | all | global | local.
+%% @type sel_type() = type() | names | props | counters | aggr_counters.
+%% @type context() = {scope(), type()} | type(). {'all','all'} is the default
+%%
 %% @type headpat() = {keypat(),pidpat(),ValPat}.
 %% @type keypat() = {sel_type() | sel_var(),
 %%                   l | g | sel_var(),
@@ -33,32 +57,46 @@
 %% @type pidpat() = pid() | sel_var().
 %% sel_var() = DollarVar | '_'.
 %% @type sel_pattern() = [{headpat(), Guards, Prod}].
-%% @type key()   = {type(), scope(), any()}
-%% @end
+%% @type key()   = {type(), scope(), any()}.
+
 -module(gproc).
 -behaviour(gen_server).
- 
+
 -export([start_link/0,
          reg/1, reg/2, unreg/1,
+	 reg_shared/1, reg_shared/2, unreg_shared/1,
          mreg/3,
+         munreg/3,
          set_value/2,
-         get_value/1,
+         get_value/1, get_value/2,
          where/1,
          await/1, await/2,
          nb_wait/1,
          cancel_wait/2,
          lookup_pid/1,
          lookup_pids/1,
+         lookup_value/1,
          lookup_values/1,
          update_counter/2,
+	 reset_counter/1,
+	 update_shared_counter/2,
+         give_away/2,
+         goodbye/0,
          send/2,
          info/1, info/2,
+	 i/0,
          select/1, select/2, select/3,
+         select_count/1, select_count/2,
          first/1,
          next/2,
          prev/2,
          last/1,
-         table/1, table/2]).
+         table/0, table/1, table/2]).
+
+%% Environment handling
+-export([get_env/3, get_env/4,
+         get_set_env/3, get_set_env/4,
+         set_env/5]).
 
 %% Convenience functions
 -export([add_local_name/1,
@@ -69,6 +107,7 @@
          add_global_counter/2,
          add_local_aggr_counter/1,
          add_global_aggr_counter/1,
+	 add_shared_local_counter/2,
          lookup_local_name/1,
          lookup_global_name/1,
          lookup_local_properties/1,
@@ -77,6 +116,10 @@
          lookup_global_counters/1,
          lookup_local_aggr_counter/1,
          lookup_global_aggr_counter/1]).
+
+%% Callbacks for behaviour support
+-export([whereis_name/1,
+         unregister_name/1]).
 
 -export([default/1]).
 
@@ -113,12 +156,14 @@
 %%
 %% @doc Starts the gproc server.
 %%
-%% This function is intended to be called from gproc_sup, as part of 
+%% This function is intended to be called from gproc_sup, as part of
 %% starting the gproc application.
 %% @end
 start_link() ->
-    create_tabs(),
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+    _ = create_tabs(),
+    SpawnOpts = gproc_lib:valid_opts(server_options, []),
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [],
+			  [{spawn_opt, SpawnOpts}]).
 
 %% spec(Name::any()) -> true
 %%
@@ -161,6 +206,16 @@ add_local_counter(Name, Initial) when is_integer(Initial) ->
 
 %% spec(Name::any(), Initial::integer()) -> true
 %%
+%% @doc Registers a local shared (unique) counter. 
+%% @equiv reg_shared({c,l,Name},Value)
+%% @end
+%%
+add_shared_local_counter(Name, Initial) when is_integer(Initial) ->
+    reg_shared({c,l,Name}, Initial).
+
+
+%% spec(Name::any(), Initial::integer()) -> true
+%%
 %% @doc Registers a global (non-unique) counter. @equiv reg({c,g,Name},Value)
 %% @end
 %%
@@ -182,7 +237,7 @@ add_local_aggr_counter(Name)  -> reg({a,l,Name}).
 %% @end
 %%
 add_global_aggr_counter(Name) -> reg({a,g,Name}).
-    
+
 
 %% @spec (Name::any()) -> pid()
 %%
@@ -217,7 +272,7 @@ lookup_local_aggr_counter(Name)  -> lookup_value({a,l,Name}).
 %% @end
 %%
 lookup_global_aggr_counter(Name) -> lookup_value({a,g,Name}).
-    
+
 
 %% @spec (Property::any()) -> [{pid(), Value}]
 %%
@@ -257,7 +312,264 @@ lookup_local_counters(P)    -> lookup_values({c,l,P}).
 %%
 lookup_global_counters(P)   -> lookup_values({c,g,P}).
 
+%% @spec get_env(Scope::scope(), App::atom(), Key::atom()) -> term()
+%% @equiv get_env(Scope, App, Key, [app_env])
+get_env(Scope, App, Key) ->
+    get_env(Scope, App, Key, [app_env]).
 
+%% @spec (Scope::scope(), App::atom(), Key::atom(), Strategy) -> term()
+%%   Strategy = [Alternative]
+%%   Alternative = app_env
+%%               | os_env
+%%               | inherit | {inherit, pid()} | {inherit, unique_id()}
+%%               | init_arg
+%%               | {mnesia, ActivityType, Oid, Pos}
+%%               | {default, term()}
+%%               | error
+%% @doc Read an environment value, potentially cached as a `gproc_env' property.
+%%
+%% This function first tries to read the value of a cached property,
+%% `{p, Scope, {gproc_env, App, Key}}'. If this fails, it will try the provided
+%% alternative strategy. `Strategy' is a list of alternatives, tried in order.
+%% Each alternative can be one of:
+%%
+%% * `app_env' - try `application:get_env(App, Key)'
+%% * `os_env' - try `os:getenv(ENV)', where `ENV' is `Key' converted into an
+%%   uppercase string
+%% * `{os_env, ENV}' - try `os:getenv(ENV)'
+%% * `inherit' - inherit the cached value, if any, held by the parent process.
+%% * `{inherit, Pid}' - inherit the cached value, if any, held by `Pid'.
+%% * `{inherit, Id}' - inherit the cached value, if any, held by the process
+%%    registered in `gproc' as `Id'.
+%% * `init_arg' - try `init:get_argument(Key)'; expects a single value, if any.
+%% * `{mnesia, ActivityType, Oid, Pos}' - try
+%%   `mnesia:activity(ActivityType, fun() -> mnesia:read(Oid) end)'; retrieve
+%%    the value in position `Pos' if object found.
+%% * `{default, Value}' - set a default value to return once alternatives have
+%%    been exhausted; if not set, `undefined' will be returned.
+%% * `error' - raise an exception, `erlang:error(gproc_env, [App, Key, Scope])'.
+%%
+%% While any alternative can occur more than once, the only one that might make
+%% sense to use multiple times is `{default, Value}'.
+%%
+%% The return value will be one of:
+%%
+%% * The value of the first matching alternative, or `error' eception,
+%%   whichever comes first
+%% * The last instance of `{default, Value}', or `undefined', if there is no
+%%   matching alternative, default or `error' entry in the list.
+%%
+%% The `error' option can be used to assert that a value has been previously
+%% cached. Alternatively, it can be used to assert that a value is either cached
+%% or at least defined somewhere,
+%% e.g. `get_env(l, mnesia, dir, [app_env, error])'.
+%% @end
+get_env(Scope, App, Key, Strategy)
+  when Scope==l, is_atom(App), is_atom(Key);
+       Scope==g, is_atom(App), is_atom(Key) ->
+    do_get_env(Scope, App, Key, Strategy, false).
+
+%% @spec get_set_env(Scope::scope(), App::atom(), Key::atom()) -> term()
+%% @equiv get_set_env(Scope, App, Key, [app_env])
+get_set_env(Scope, App, Key) ->
+    get_set_env(Scope, App, Key, [app_env]).
+
+%% @spec get_set_env(Scope::scope(), App::atom(), Key::atom(), Strategy) ->
+%%           Value
+%% @doc Fetch and cache an environment value, if not already cached.
+%%
+%% This function does the same thing as {@link get_env/4}, but also updates the
+%% cache. Note that the cache will be updated even if the result of the lookup
+%% is `undefined'.
+%%
+%% @see get_env/4.
+%% @end
+%%
+get_set_env(Scope, App, Key, Strategy)
+  when Scope==l, is_atom(App), is_atom(Key);
+       Scope==g, is_atom(App), is_atom(Key) ->
+    do_get_env(Scope, App, Key, Strategy, true).
+
+do_get_env(Context, App, Key, Alternatives, Set) ->
+    case lookup_env(Context, App, Key, self()) of
+        undefined ->
+            check_alternatives(Alternatives, Context, App, Key, undefined, Set);
+        {ok, Value} ->
+            Value
+    end.
+
+%% @spec set_env(Scope::scope(), App::atom(),
+%%               Key::atom(), Value::term(), Strategy) -> Value
+%%   Strategy = [Alternative]
+%%   Alternative = app_env | os_env | {os_env, VAR}
+%%                | {mnesia, ActivityType, Oid, Pos}
+%%
+%% @doc Updates the cached value as well as underlying environment.
+%%
+%% This function should be exercised with caution, as it affects the larger
+%% environment outside gproc. This function modifies the cached value, and then
+%% proceeds to update the underlying environment (OS environment variable or
+%% application environment variable).
+%%
+%% When the `mnesia' alternative is used, gproc will try to update any existing
+%% object, changing only the `Pos' position. If no such object exists, it will
+%% create a new object, setting any other attributes (except `Pos' and the key)
+%% to `undefined'.
+%% @end
+%%
+set_env(Scope, App, Key, Value, Strategy)
+  when Scope==l, is_atom(App), is_atom(Key);
+       Scope==g, is_atom(App), is_atom(Key) ->
+    case is_valid_set_strategy(Strategy, Value) of
+        true ->
+            update_cached_env(Scope, App, Key, Value),
+            set_strategy(Strategy, App, Key, Value);
+        false ->
+            erlang:error(badarg)
+    end.
+
+check_alternatives([{default, Val}|Alts], Scope, App, Key, _, Set) ->
+    check_alternatives(Alts, Scope, App, Key, Val, Set);
+check_alternatives([H|T], Scope, App, Key, Def, Set) ->
+    case try_alternative(H, App, Key, Scope) of
+        undefined ->
+            check_alternatives(T, Scope, App, Key, Def, Set);
+        {ok, Value} ->
+            if Set ->
+                    cache_env(Scope, App, Key, Value),
+                    Value;
+               true ->
+                    Value
+            end
+    end;
+check_alternatives([], Scope, App, Key, Def, Set) ->
+    if Set ->
+            cache_env(Scope, App, Key, Def);
+       true ->
+            ok
+    end,
+    Def.
+
+try_alternative(error, App, Key, Scope) ->
+    erlang:error(gproc_env, [App, Key, Scope]);
+try_alternative(inherit, App, Key, Scope) ->
+    case get('$ancestors') of
+        [P|_] ->
+            lookup_env(Scope, App, Key, P);
+        _ ->
+            undefined
+    end;
+try_alternative({inherit, P}, App, Key, Scope) when is_pid(P) ->
+    lookup_env(Scope, App, Key, P);
+try_alternative({inherit, P}, App, Key, Scope) ->
+    case where(P) of
+        undefined -> undefined;
+        Pid when is_pid(Pid) ->
+            lookup_env(Scope, App, Key, Pid)
+    end;
+try_alternative(app_env, App, Key, _Scope) ->
+    case application:get_env(App, Key) of
+        undefined       -> undefined;
+        {ok, undefined} -> undefined;
+        {ok, Value}     -> {ok, Value}
+    end;
+try_alternative(os_env, _App, Key, _) ->
+    case os:getenv(os_env_key(Key)) of
+        false  -> undefined;
+        Val -> {ok, Val}
+    end;
+try_alternative({os_env, Key}, _, _, _) ->
+    case os:getenv(Key) of
+        false  -> undefined;
+        Val -> {ok, Val}
+    end;
+try_alternative(init_arg, _, Key, _) ->
+    case init:get_argument(Key) of
+        {ok, [[Value]]} ->
+            {ok, Value};
+        error ->
+            undefined
+    end;
+try_alternative({mnesia,Type,Key,Pos}, _, _, _) ->
+    case mnesia:activity(Type, fun() -> mnesia:read(Key) end) of
+        [] -> undefined;
+        [Found] ->
+            {ok, element(Pos, Found)}
+    end.
+
+os_env_key(Key) ->
+    string:to_upper(atom_to_list(Key)).
+
+lookup_env(Scope, App, Key, P) ->
+    case ets:lookup(?TAB, {{p, Scope, {gproc_env, App, Key}}, P}) of
+        [] ->
+            undefined;
+        [{_, _, Value}] ->
+            {ok, Value}
+    end.
+
+cache_env(Scope, App, Key, Value) ->
+    reg({p, Scope, {gproc_env, App, Key}}, Value).
+
+update_cached_env(Scope, App, Key, Value) ->
+    case lookup_env(Scope, App, Key, self()) of
+        undefined ->
+            cache_env(Scope, App, Key, Value);
+        {ok, _} ->
+            set_value({p, Scope, {gproc_env, App, Key}}, Value)
+    end.
+
+is_valid_set_strategy([os_env|T], Value) ->
+    is_string(Value) andalso is_valid_set_strategy(T, Value);
+is_valid_set_strategy([{os_env, _}|T], Value) ->
+    is_string(Value) andalso is_valid_set_strategy(T, Value);
+is_valid_set_strategy([app_env|T], Value) ->
+    is_valid_set_strategy(T, Value);
+is_valid_set_strategy([{mnesia,_Type,_Oid,_Pos}|T], Value) ->
+    is_valid_set_strategy(T, Value);
+is_valid_set_strategy([], _) ->
+    true;
+is_valid_set_strategy(_, _) ->
+    false.
+
+set_strategy([H|T], App, Key, Value) ->
+    case H of
+        app_env ->
+            application:set_env(App, Key, Value);
+        os_env ->
+            os:putenv(os_env_key(Key), Value);
+        {os_env, ENV} ->
+            os:putenv(ENV, Value);
+        {mnesia,Type,Oid,Pos} ->
+            mnesia:activity(
+              Type,
+              fun() ->
+                      Rec = case mnesia:read(Oid) of
+                                [] ->
+                                    {Tab,K} = Oid,
+                                    Tag = mnesia:table_info(Tab, record_name),
+                                    Attrs = mnesia:table_info(Tab, attributes),
+                                    list_to_tuple(
+                                      [Tag,K |
+                                       [undefined || _ <- tl(Attrs)]]);
+                                [Old] ->
+                                    Old
+                            end,
+                      mnesia:write(setelement(Pos, Rec, Value))
+              end)
+    end,
+    set_strategy(T, App, Key, Value);
+set_strategy([], _, _, Value) ->
+    Value.
+
+is_string(S) ->
+    try begin _ = iolist_to_binary(S),
+              true
+        end
+    catch
+        error:_ ->
+            false
+    end.
 
 %% @spec reg(Key::key()) -> true
 %%
@@ -280,11 +592,11 @@ await(Key) ->
 %%   Timeout = integer() | infinity
 %%
 %% @doc Wait for a local name to be registered.
-%% The function raises an exception if the timeout expires. Timeout must be 
+%% The function raises an exception if the timeout expires. Timeout must be
 %% either an interger &gt; 0 or 'infinity'.
 %% A small optimization: we first perform a lookup, to see if the name
-%% is already registered. This way, the cost of the operation will be 
-%% roughly the same as of where/1 in the case where the name is already 
+%% is already registered. This way, the cost of the operation will be
+%% roughly the same as of where/1 in the case where the name is already
 %% registered (the difference: await/2 also returns the value).
 %% @end
 %%
@@ -309,13 +621,19 @@ request_wait({n,C,_} = Key, Timeout) when C==l; C==g ->
                _ ->
                    erlang:error(badarg, [Key, Timeout])
            end,
-    WRef = call({await,Key,self()}, C),
+    WRef = case {call({await,Key,self()}, C), C} of
+               {{R, {Kg,Pg,Vg}}, g} ->
+                   self() ! {gproc, R, registered, {Kg,Pg,Vg}},
+                   R;
+               {R,_} ->
+                   R
+           end,
     receive
         {gproc, WRef, registered, {_K, Pid, V}} ->
-	    case TRef of
-		no_timer -> ignore;
-		_ -> erlang:cancel_timer(TRef)
-	    end,
+            _ = case TRef of
+                    no_timer -> ignore;
+                    _ -> erlang:cancel_timer(TRef)
+                end,
             {Pid, V};
         {timeout, TRef, gproc_timeout} ->
             cancel_wait(Key, WRef),
@@ -345,7 +663,7 @@ cancel_wait({_,g,_} = Key, Ref) ->
 cancel_wait({_,l,_} = Key, Ref) ->
     cast({cancel_wait, self(), Key, Ref}, l),
     ok.
-            
+
 
 %% @spec reg(Key::key(), Value) -> true
 %%
@@ -367,11 +685,53 @@ reg({n,l,_} = Key, Value) ->
 reg(_, _) ->
     erlang:error(badarg).
 
+
+%% @spec reg_shared(Key::key()) -> true
+%%
+%% @doc Register a resource, but don't tie it to a particular process.
+%%
+%% `reg_shared({c,l,C}) -> reg_shared({c,l,C}, 0).'
+%% `reg_shared({a,l,A}) -> reg_shared({a,l,A}, undefined).'
+%% @end
+reg_shared({c,_,_} = Key) ->
+    reg_shared(Key, 0);
+reg_shared({a,_,_} = Key) ->
+    reg_shared(Key, undefined).
+
+
+%% @spec reg_shared(Key::key(), Value) -> true
+%%
+%% @doc Register a resource, but don't tie it to a particular process.
+%%
+%% Shared resources are all unique. They remain until explicitly unregistered
+%% (using {@link unreg_shared/1}). The types of shared resources currently
+%% supported are `counter' and `aggregated counter'. In listings and query
+%% results, shared resources appear as other similar resources, except that
+%% `Pid == shared'. To wit, update_counter({c,l,myCounter}, 1, shared) would
+%% increment the shared counter `myCounter' with 1, provided it exists.
+%%
+%% A shared aggregated counter will track updates in exactly the same way as
+%% an aggregated counter which is owned by a process.
+%% @end
+%%
+reg_shared({_,g,_} = Key, Value) ->
+    %% anything global
+    ?CHK_DIST,
+    gproc_dist:reg_shared(Key, Value);
+reg_shared({a,l,_} = Key, undefined) ->
+    call({reg_shared, Key, undefined});
+reg_shared({c,l,_} = Key, Value) when is_integer(Value) ->
+    call({reg_shared, Key, Value});
+reg_shared(_, _) ->
+    erlang:error(badarg).
+
 %% @spec mreg(type(), scope(), [{Key::any(), Value::any()}]) -> true
 %%
 %% @doc Register multiple {Key,Value} pairs of a given type and scope.
-%% 
+%%
 %% This function is more efficient than calling {@link reg/2} repeatedly.
+%% It is also atomic in regard to unique names; either all names are registered
+%% or none are.
 %% @end
 mreg(T, g, KVL) ->
     ?CHK_DIST,
@@ -387,6 +747,40 @@ mreg(p, l, KVL) ->
 mreg(_, _, _) ->
     erlang:error(badarg).
 
+%% @spec munreg(type(), scope(), [Key::any()]) -> true
+%%
+%% @doc Unregister multiple Key items of a given type and scope.
+%%
+%% This function is usually more efficient than calling {@link unreg/1}
+%% repeatedly.
+%% @end
+munreg(T, g, L) ->
+    ?CHK_DIST,
+    gproc_dist:munreg(T, existing(T,g,L));
+munreg(T, l, L) when T==a; T==n ->
+    if is_list(L) ->
+            call({munreg, T, l, existing(T,l,L)});
+       true ->
+            erlang:error(badarg)
+    end;
+munreg(p, l, L) ->
+    local_munreg(p, existing(p,l,L));
+munreg(_, _, _) ->
+    erlang:error(badarg).
+
+existing(T,Scope,L) ->
+    Keys = if T==p; T==c ->
+                   [{{T,Scope,K}, self()} || K <- L];
+              T==a; T==n ->
+                   [{{T,Scope,K}, T} || K <- L]
+           end,
+    _ = [case ets:member(?TAB, K) of
+             false -> erlang:error(badarg);
+             true  -> true
+         end || K <- Keys],
+    L.
+
+
 %% @spec (Key:: key()) -> true
 %%
 %% @doc Unregister a name or property.
@@ -401,11 +795,38 @@ unreg(Key) ->
         {_, l, _} ->
             case ets:member(?TAB, {Key,self()}) of
                 true ->
-                    gproc_lib:remove_reg(Key, self());
+                    _ = gproc_lib:remove_reg(Key, self()),
+                    true;
                 false ->
                     erlang:error(badarg)
             end
     end.
+
+%% @spec (Key:: key()) -> true
+%%
+%% @doc Unregister a shared resource.
+%% @end
+unreg_shared(Key) ->
+    case Key of
+        {_, g, _} ->
+            ?CHK_DIST,
+            gproc_dist:unreg_shared(Key);
+        {T, l, _} when T == c;
+                       T == a -> call({unreg_shared, Key});
+        _ ->
+	    erlang:error(badarg)
+    end.
+
+%% @equiv unreg/1
+unregister_name(Key) ->
+    unreg(Key).
+
+%% @spec (Continuation ::term()) -> {[Match],Continuation} | '$end_of_table'
+%% @doc
+%% see http://www.erlang.org/doc/man/ets.html#select-1
+%% @end
+select({?TAB, _, _, _, _, _, _, _} = Continuation) ->
+    ets:select(Continuation);
 
 %% @spec (select_pattern()) -> list(sel_object())
 %% @doc
@@ -414,24 +835,42 @@ unreg(Key) ->
 select(Pat) ->
     select(all, Pat).
 
-%% @spec (Type::sel_type(), Pat::sel_pattern()) -> [{Key, Pid, Value}]
+%% @spec (Context::context(), Pat::sel_pattern()) -> [{Key, Pid, Value}]
 %%
 %% @doc Perform a select operation on the process registry.
 %%
 %% The physical representation in the registry may differ from the above,
 %% but the select patterns are transformed appropriately.
 %% @end
-select(Type, Pat) ->
-    ets:select(?TAB, pattern(Pat, Type)).
+select(Context, Pat) ->
+    ets:select(?TAB, pattern(Pat, Context)).
 
-%% @spec (Type::sel_type(), Pat::sel_patten(), Limit::integer()) ->
-%%          [{Key, Pid, Value}]
+%% @spec (Context::context(), Pat::sel_patten(), Limit::integer()) ->
+%%          {[Match],Continuation} | '$end_of_table'
 %% @doc Like {@link select/2} but returns Limit objects at a time.
 %%
 %% See [http://www.erlang.org/doc/man/ets.html#select-3].
 %% @end
-select(Type, Pat, Limit) ->
-    ets:select(?TAB, pattern(Pat, Type), Limit).
+select(Context, Pat, Limit) ->
+    ets:select(?TAB, pattern(Pat, Context), Limit).
+
+
+%% @spec (select_pattern()) -> list(sel_object())
+%% @doc
+%% @equiv select_count(all, Pat)
+%% @end
+select_count(Pat) ->
+    select_count(all, Pat).
+
+%% @spec (Context::context(), Pat::sel_pattern()) -> [{Key, Pid, Value}]
+%%
+%% @doc Perform a select_count operation on the process registry.
+%%
+%% The physical representation in the registry may differ from the above,
+%% but the select patterns are transformed appropriately.
+%% @end
+select_count(Context, Pat) ->
+    ets: select_count(?TAB, pattern(Pat, Context)).
 
 
 %%% Local properties can be registered in the local process, since
@@ -450,12 +889,13 @@ local_mreg(T, [_|_] = KVL) ->
         {true,_}  -> monitor_me()
     end.
 
-
-
+local_munreg(T, L) when T==p; T==c ->
+    _ = [gproc_lib:remove_reg({T,l,K}, self()) || K <- L],
+    true.
 
 %% @spec (Key :: key(), Value) -> true
 %% @doc Sets the value of the registeration entry given by Key
-%% 
+%%
 %% Key is assumed to exist and belong to the calling process.
 %% If it doesn't, this function will exit.
 %%
@@ -485,17 +925,21 @@ set_value({c,l,_} = Key, Value) when is_integer(Value) ->
 set_value(_, _) ->
     erlang:error(badarg).
 
-
-
-
 %% @spec (Key) -> Value
-%% @doc Read the value stored with a key registered to the current process.
+%% @doc Reads the value stored with a key registered to the current process.
 %%
 %% If no such key is registered to the current process, this function exits.
 %% @end
 get_value(Key) ->
     get_value(Key, self()).
 
+%% @spec (Key, Pid) -> Value
+%% @doc Reads the value stored with a key registered to the process Pid.
+%%
+%% If `Pid == shared', the value of a shared key (see {@link reg_shared/1})
+%% will be read.
+%% @end
+%%
 get_value({T,_,_} = Key, Pid) when is_pid(Pid) ->
     if T==n orelse T==a ->
             case ets:lookup(?TAB, {Key, T}) of
@@ -504,6 +948,15 @@ get_value({T,_,_} = Key, Pid) when is_pid(Pid) ->
             end;
        true ->
             ets:lookup_element(?TAB, {Key, Pid}, 3)
+    end;
+get_value({T,_,_} = K, shared) when T==c; T==a ->
+    Key = case T of
+	      c -> {K, shared};
+	      a -> {K, a}
+	  end,
+    case ets:lookup(?TAB, Key) of
+	[{_, shared, Value}] -> Value;
+	_ -> erlang:error(badarg)
     end;
 get_value(_, _) ->
     erlang:error(badarg).
@@ -518,6 +971,9 @@ lookup_pid({_T,_,_} = Key) ->
         P -> P
     end.
 
+%% @spec (Key) -> Value
+%% @doc Lookup the value stored with a key.
+%%
 lookup_value({T,_,_} = Key) ->
     if T==n orelse T==a ->
             ets:lookup_element(?TAB, {Key,T}, 3);
@@ -528,7 +984,7 @@ lookup_value({T,_,_} = Key) ->
 %% @spec (Key::key()) -> pid()
 %%
 %% @doc Returns the pid registered as Key
-%% 
+%%
 %% The type of registration entry must be either name or aggregated counter.
 %% Otherwise this function will exit. Use {@link lookup_pids/1} in these
 %% cases.
@@ -539,16 +995,20 @@ where({T,_,_}=Key) ->
             case ets:lookup(?TAB, {Key,T}) of
                 [{_, P, _Value}] ->
                     case my_is_process_alive(P) of
-			true -> P;
-			false ->
-			    undefined
-		    end;
+                        true -> P;
+                        false ->
+                            undefined
+                    end;
                 _ ->  % may be [] or [{Key,Waiters}]
                     undefined
             end;
        true ->
             erlang:error(badarg)
     end.
+
+%% @equiv where/1
+whereis_name(Key) ->
+    where(Key).
 
 %% @spec (Key::key()) -> [pid()]
 %%
@@ -561,10 +1021,10 @@ where({T,_,_}=Key) ->
 %%
 lookup_pids({T,_,_} = Key) ->
     L = if T==n orelse T==a ->
-		ets:select(?TAB, [{{{Key,T}, '$1', '_'},[],['$1']}]);
-	   true ->
-		ets:select(?TAB, [{{{Key,'_'}, '$1', '_'},[],['$1']}])
-	end,
+                ets:select(?TAB, [{{{Key,T}, '$1', '_'},[],['$1']}]);
+           true ->
+                ets:select(?TAB, [{{{Key,'_'}, '$1', '_'},[],['$1']}])
+        end,
     [P || P <- L, my_is_process_alive(P)].
 
 
@@ -575,9 +1035,6 @@ my_is_process_alive(P) when node(P) =:= node() ->
 my_is_process_alive(_) ->
     %% remote pid - assume true (too costly to find out)
     true.
-
-
-
 
 %% @spec (Key::key()) -> [{pid(), Value}]
 %%
@@ -590,20 +1047,18 @@ my_is_process_alive(_) ->
 %%
 lookup_values({T,_,_} = Key) ->
     L = if T==n orelse T==a ->
-		ets:select(?TAB, [{{{Key,T}, '$1', '$2'},[],[{{'$1','$2'}}]}]);
-	   true ->
-		ets:select(?TAB, [{{{Key,'_'}, '$1', '$2'},[],[{{'$1','$2'}}]}])
-	end,
+                ets:select(?TAB, [{{{Key,T}, '$1', '$2'},[],[{{'$1','$2'}}]}]);
+           true ->
+                ets:select(?TAB, [{{{Key,'_'}, '$1', '$2'},[],[{{'$1','$2'}}]}])
+        end,
     [Pair || {P,_} = Pair <- L, my_is_process_alive(P)].
-
-
 
 %% @spec (Key::key(), Incr::integer()) -> integer()
 %%
 %% @doc Updates the counter registered as Key for the current process.
 %%
 %% This function works like ets:update_counter/3
-%% (see [http://www.erlang.org/doc/man/ets.html#update_counter-3]), but 
+%% (see [http://www.erlang.org/doc/man/ets.html#update_counter-3]), but
 %% will fail if the type of object referred to by Key is not a counter.
 %% @end
 %%
@@ -616,14 +1071,83 @@ update_counter(_, _) ->
     erlang:error(badarg).
 
 
+%% @spec (Key) -> {ValueBefore, ValueAfter}
+%%   Key   = {c, Scope, Name}
+%%   Scope = l | g
+%%   ValueBefore = integer()
+%%   ValueAfter  = integer()
+%%
+%% @doc Reads and resets a counter in a "thread-safe" way
+%%
+%% This function reads the current value of a counter and then resets it to its
+%% initial value. The reset operation is done using {@link update_counter/2},
+%% which allows for concurrent calls to {@link update_counter/2} without losing
+%% updates. Aggregated counters are updated accordingly.
+%% @end
+%%
+reset_counter({c,g,_} = Key) ->
+    ?CHK_DIST,
+    gproc_dist:reset_counter(Key);
+reset_counter({c,l,_} = Key) ->
+    Current = ets:lookup_element(?TAB, {Key, self()}, 3),
+    Initial = case ets:lookup(?TAB, {self(), Key}) of
+		  [{_, r}] -> 0;
+		  [{_, Opts}] ->
+		      proplists:get_value(initial, Opts, 0)
+	      end,
+    {Current, update_counter(Key, Initial - Current)}.
+
+
+update_shared_counter({c,g,_} = Key, Incr) ->
+    ?CHK_DIST,
+    gproc_dist:update_shared_counter(Key, Incr);
+update_shared_counter({c,l,_} = Key, Incr) ->
+    gproc_lib:update_counter(Key, Incr, shared).
+
+%% @spec (From::key(), To::pid() | key()) -> undefined | pid()
+%%
+%% @doc Atomically transfers the key `From' to the process identified by `To'.
+%%
+%% This function transfers any gproc key (name, property, counter, aggr counter)
+%% from one process to another, and returns the pid of the new owner.
+%%
+%% `To' must be either a pid or a unique name (name or aggregated counter), but
+%% does not necessarily have to resolve to an existing process. If there is
+%% no process registered with the `To' key, `give_away/2' returns `undefined',
+%% and the `From' key is effectively unregistered.
+%%
+%% It is allowed to give away a key to oneself, but of course, this operation
+%% will have no effect.
+%%
+%% Fails with `badarg' if the calling process does not have a `From' key
+%% registered.
+%% @end
+give_away({_,l,_} = Key, ToPid) when is_pid(ToPid), node(ToPid) == node() ->
+    call({give_away, Key, ToPid});
+give_away({_,l,_} = Key, {n,l,_} = ToKey) ->
+    call({give_away, Key, ToKey});
+give_away({_,g,_} = Key, To) ->
+    ?CHK_DIST,
+    gproc_dist:give_away(Key, To).
+
+%% @spec () -> ok
+%%
+%% @doc Unregister all items of the calling process and inform gproc
+%% to forget about the calling process.
+%%
+%% This function is more efficient than letting gproc perform these
+%% cleanup operations.
+%% @end
+goodbye() ->
+    process_is_down(self()).
 
 %% @spec (Key::key(), Msg::any()) -> Msg
 %%
 %% @doc Sends a message to the process, or processes, corresponding to Key.
 %%
-%% If Key belongs to a unique object (name or aggregated counter), this 
+%% If Key belongs to a unique object (name or aggregated counter), this
 %% function will send a message to the corresponding process, or fail if there
-%% is no such process. If Key is for a non-unique object type (counter or 
+%% is no such process. If Key is for a non-unique object type (counter or
 %% property), Msg will be send to all processes that have such an object.
 %% @end
 %%
@@ -649,7 +1173,7 @@ send(_, _) ->
     erlang:error(badarg).
 
 
-%% @spec (Type :: type()) -> key() | '$end_of_table'
+%% @spec (Context :: context()) -> key() | '$end_of_table'
 %%
 %% @doc Behaves as ets:first(Tab) for a given type of registration object.
 %%
@@ -657,8 +1181,9 @@ send(_, _) ->
 %%  The registry behaves as an ordered_set table.
 %% @end
 %%
-first(Type) ->
-    {HeadPat,_} = headpat(Type, '_', '_', '_'),
+first(Context) ->
+    {S, T} = get_s_t(Context),
+    {HeadPat,_} = headpat({S, T}, '_', '_', '_'),
     case ets:select(?TAB, [{HeadPat,[],[{element,1,'$_'}]}], 1) of
         {[First], _} ->
             First;
@@ -676,8 +1201,8 @@ first(Type) ->
 %%
 last(Context) ->
     {S, T} = get_s_t(Context),
-    S1 = if S == '_'; S == l -> m;
-            S == g -> h
+    S1 = if S == '_'; S == l -> m;              % 'm' comes after 'l'
+            S == g -> h                         % 'h' comes between 'g' & 'l'
          end,
     Beyond = {{T,S1,[]},[]},
     step(ets:prev(?TAB, Beyond), S, T).
@@ -733,8 +1258,8 @@ step(Key, S, T) ->
 %% ProcessInfo = [{gproc, [{Key,Value}]} | ProcessInfo]
 %%
 %% @doc Similar to `process_info(Pid)' but with additional gproc info.
-%% 
-%% Returns the same information as process_info(Pid), but with the 
+%%
+%% Returns the same information as process_info(Pid), but with the
 %% addition of a `gproc' information item, containing the `{Key,Value}'
 %% pairs registered to the process.
 %% @end
@@ -747,15 +1272,15 @@ info(Pid) when is_pid(Pid) ->
 %% @doc Similar to process_info(Pid, Item), but with additional gproc info.
 %%
 %% For `Item = gproc', this function returns a list of `{Key, Value}' pairs
-%% registered to the process Pid. For other values of Item, it returns the 
+%% registered to the process Pid. For other values of Item, it returns the
 %% same as [http://www.erlang.org/doc/man/erlang.html#process_info-2].
 %% @end
 info(Pid, ?MODULE) ->
-    Keys = ets:select(?TAB, [{ {{Pid,'$1'}, r}, [], ['$1'] }]),
+    Keys = ets:select(?TAB, [{ {{Pid,'$1'}, '_'}, [], ['$1'] }]),
     {?MODULE, lists:zf(
                 fun(K) ->
                         try V = get_value(K, Pid),
-                            {true, {K,V}}
+			      {true, {K,V}}
                         catch
                             error:_ ->
                                 false
@@ -764,8 +1289,13 @@ info(Pid, ?MODULE) ->
 info(Pid, I) ->
     process_info(Pid, I).
 
-
-
+%% @spec () -> ok
+%%
+%% @doc Similar to the built-in shell command `i()' but inserts information
+%% about names and properties registered in Gproc, where applicable.
+%% @end
+i() ->
+    gproc_info:i().
 
 %%% ==========================================================
 
@@ -774,15 +1304,24 @@ handle_cast({monitor_me, Pid}, S) ->
     erlang:monitor(process, Pid),
     {noreply, S};
 handle_cast({cancel_wait, Pid, {T,_,_} = Key, Ref}, S) ->
+    Rev = {Pid,Key},
     case ets:lookup(?TAB, {Key,T}) of
         [{K, Waiters}] ->
-            NewWaiters = Waiters -- [{Pid,Ref}],
-            %% for now, we don't remove the reverse entry. If we should do
-            %% that, we have to make sure that Pid doesn't have another
-            %% waiter (which it shouldn't have, given that the wait is 
-            %% synchronous). Keeping it is not problematic - worst case, we
-            %% will get an unnecessary cleanup.
-            ets:insert(?TAB, {K, NewWaiters});
+            case Waiters -- [{Pid,Ref}] of
+                [] ->
+                    ets:delete(?TAB, K),
+                    ets:delete(?TAB, Rev);
+                NewWaiters ->
+                    ets:insert(?TAB, {K, NewWaiters}),
+                    case lists:keymember(Pid, 1, NewWaiters) of
+                        true ->
+                            %% should be extremely unlikely
+                            ok;
+                        false ->
+                            %% delete the reverse entry
+                            ets:delete(?TAB, Rev)
+                    end
+            end;
         _ ->
             ignore
     end,
@@ -792,46 +1331,40 @@ handle_cast({cancel_wait, Pid, {T,_,_} = Key, Ref}, S) ->
 handle_call({reg, {_T,l,_} = Key, Val}, {Pid,_}, S) ->
     case try_insert_reg(Key, Val, Pid) of
         true ->
-            gproc_lib:ensure_monitor(Pid,l),
+            _ = gproc_lib:ensure_monitor(Pid,l),
             {reply, true, S};
         false ->
             {reply, badarg, S}
+    end;
+handle_call({reg_shared, {_T,l,_} = Key, Val}, _From, S) ->
+    case try_insert_reg(Key, Val, shared) of
+    %% case try_insert_shared(Key, Val) of
+	true ->
+	    {reply, true, S};
+	false ->
+	    {reply, badarg, S}
     end;
 handle_call({unreg, {_,l,_} = Key}, {Pid,_}, S) ->
     case ets:member(?TAB, {Pid,Key}) of
         true ->
-            gproc_lib:remove_reg(Key, Pid),
+            _ = gproc_lib:remove_reg(Key, Pid),
             {reply, true, S};
         false ->
             {reply, badarg, S}
     end;
-handle_call({await, {_,l,_} = Key, Pid}, {_, Ref}, S) ->
+handle_call({unreg_shared, {_,l,_} = Key}, _, S) ->
+    _ = gproc_lib:remove_reg(Key, shared),
+    {reply, true, S};
+handle_call({await, {_,l,_} = Key, Pid}, From, S) ->
     %% Passing the pid explicitly is needed when leader_call is used,
     %% since the Pid given as From in the leader is the local gen_leader
     %% instance on the calling node.
-    case gproc_lib:await(Key, {Pid, Ref}) of
+    case gproc_lib:await(Key, Pid, From) of
         noreply ->
             {noreply, S};
         {reply, Reply, _} ->
             {reply, Reply, S}
     end;
-%%     Rev = {{Pid,Key}, r},
-%%     case ets:lookup(?TAB, {Key,T}) of
-%%         [{_, P, Value}] ->
-%%             %% for symmetry, we always reply with Ref and then send a message
-%%             gen_server:reply(From, Ref),
-%%             Pid ! {gproc, Ref, registered, {Key, P, Value}},
-%%             {noreply, S};
-%%         [{K, Waiters}] ->
-%%             NewWaiters = [{Pid,Ref} | Waiters],
-%%             ets:insert(?TAB, [{K, NewWaiters}, Rev]),
-%%             gproc_lib:ensure_monitor(Pid,l),
-%%             {reply, Ref, S};
-%%         [] ->
-%%             ets:insert(?TAB, [{{Key,T}, [{Pid,Ref}]}, Rev]),
-%%             gproc_lib:ensure_monitor(Pid,l),
-%%             {reply, Ref, S}
-%%     end;
 handle_call({mreg, T, l, L}, {Pid,_}, S) ->
     try gproc_lib:insert_many(T, l, L, Pid) of
         {true,_} -> {reply, true, S};
@@ -839,6 +1372,9 @@ handle_call({mreg, T, l, L}, {Pid,_}, S) ->
     catch
         error:_  -> {reply, badarg, S}
     end;
+handle_call({munreg, T, l, L}, {Pid,_}, S) ->
+    _ = gproc_lib:remove_many(T, l, L, Pid),
+    {reply, true, S};
 handle_call({set, {_,l,_} = Key, Value}, {Pid,_}, S) ->
     case gproc_lib:do_set_value(Key, Value, Pid) of
         true ->
@@ -848,12 +1384,15 @@ handle_call({set, {_,l,_} = Key, Value}, {Pid,_}, S) ->
     end;
 handle_call({audit_process, Pid}, _, S) ->
     case is_process_alive(Pid) of
-	false ->
-	    process_is_down(Pid);
-	true ->
-	    ignore
+        false ->
+            process_is_down(Pid);
+        true ->
+            ignore
     end,
     {reply, ok, S};
+handle_call({give_away, Key, To}, {Pid,_}, S) ->
+    Reply = do_give_away(Key, To, Pid),
+    {reply, Reply, S};
 handle_call(_, _, S) ->
     {reply, badarg, S}.
 
@@ -868,13 +1407,13 @@ handle_info(_, S) ->
 %% @hidden
 code_change(_FromVsn, S, _Extra) ->
     %% We have changed local monitor markers from {Pid} to {Pid,l}.
-    case ets:select(?TAB, [{{'$1'},[],['$1']}]) of
-        [] ->
-            ok;
-        Pids ->
-            ets:insert(?TAB, [{P,l} || P <- Pids]),
-            ets:select_delete(?TAB, [{{'_'},[],[true]}])
-    end,
+    _ = case ets:select(?TAB, [{{'$1'},[],['$1']}]) of
+            [] ->
+                ok;
+            Pids ->
+                ets:insert(?TAB, [{P,l} || P <- Pids]),
+                ets:select_delete(?TAB, [{{'_'},[],[true]}])
+        end,
     {ok, S}.
 
 %% @hidden
@@ -893,7 +1432,7 @@ call(Req, g) ->
 chk_reply(Reply, Req) ->
     case Reply of
         badarg -> erlang:error(badarg, Req);
-        Reply  -> Reply
+        _  -> Reply
     end.
 
 
@@ -904,9 +1443,6 @@ cast(Msg, l) ->
     gen_server:cast(?MODULE, Msg);
 cast(Msg, g) ->
     gproc_dist:leader_cast(Msg).
-
-
-
 
 try_insert_reg({T,l,_} = Key, Val, Pid) ->
     case gproc_lib:insert_reg(Key, Val, Pid, l) of
@@ -930,59 +1466,130 @@ try_insert_reg({T,l,_} = Key, Val, Pid) ->
             true
     end.
 
+%% try_insert_shared({c,l,_} = Key, Val) ->
+%%     ets:insert_new(?TAB, [{{Key,shared}, shared, Val}, {{shared, Key}, []}]);
+%% try_insert_shared({a,l,_} = Key, Val) ->
+%%     ets:insert_new(?TAB, [{{Key, a}, shared, Val}, {{shared, Key}, []}]).
 
 -spec audit_process(pid()) -> ok.
 
 audit_process(Pid) when is_pid(Pid) ->
-    gen_server:call(gproc, {audit_process, Pid}, infinity).
-    
+    ok = gen_server:call(gproc, {audit_process, Pid}, infinity).
+
 
 -spec process_is_down(pid()) -> ok.
 
-process_is_down(Pid) ->
+process_is_down(Pid) when is_pid(Pid) ->
     %% delete the monitor marker
     %% io:fwrite(user, "process_is_down(~p) - ~p~n", [Pid,ets:tab2list(?TAB)]),
-    ets:delete(?TAB, {Pid,l}),
-    Revs = ets:select(?TAB, [{{{Pid,'$1'},r}, 
-                              [{'==',{element,2,'$1'},l}], ['$1']}]),
-    lists:foreach(
-      fun({n,l,_}=K) ->
-              Key = {K,n},
-              case ets:lookup(?TAB, Key) of
-                  [{_, Pid, _}] ->
-                      ets:delete(?TAB, Key);
-                  [{_, Waiters}] ->
-                      case [W || {P,_} = W <- Waiters,
-                                 P =/= Pid] of
-                          [] ->
+    Marker = {Pid,l},
+    case ets:member(?TAB, Marker) of
+        false ->
+            ok;
+        true ->
+            Revs = ets:select(?TAB, [{{{Pid,'$1'}, '_'},
+                                      [{'==',{element,2,'$1'},l}], ['$1']}]),
+            lists:foreach(
+              fun({n,l,_}=K) ->
+                      Key = {K,n},
+                      case ets:lookup(?TAB, Key) of
+                          [{_, Pid, _}] ->
                               ets:delete(?TAB, Key);
-                          Waiters1 ->
-                              ets:insert(?TAB, {Key, Waiters1})
+                          [{_, Waiters}] ->
+                              case [W || {P,_} = W <- Waiters,
+                                         P =/= Pid] of
+                                  [] ->
+                                      ets:delete(?TAB, Key);
+                                  Waiters1 ->
+                                      ets:insert(?TAB, {Key, Waiters1})
+                              end;
+                          [] ->
+                              true
                       end;
-                  [] ->
-                      true
-              end;
-         ({c,l,C} = K) ->
-              Key = {K, Pid},
-              [{_, _, Value}] = ets:lookup(?TAB, Key),
-              ets:delete(?TAB, Key),
-              gproc_lib:update_aggr_counter(l, C, -Value);
-         ({a,l,_} = K) -> 
-              ets:delete(?TAB, {K,a});
-         ({p,_,_} = K) ->
-              ets:delete(?TAB, {K, Pid})
-      end, Revs),
-    ets:select_delete(?TAB, [{{{Pid,{'_',l,'_'}},'_'}, [], [true]}]),
-    ok.
-
-create_tabs() ->
-    case ets:info(?TAB, name) of
-	undefined ->
-	    ets:new(?TAB, [ordered_set, public, named_table]);
-	_ ->
-	    ok
+                 ({c,l,C} = K) ->
+                      Key = {K, Pid},
+                      [{_, _, Value}] = ets:lookup(?TAB, Key),
+                      ets:delete(?TAB, Key),
+                      gproc_lib:update_aggr_counter(l, C, -Value);
+                 ({a,l,_} = K) ->
+                      ets:delete(?TAB, {K,a});
+                 ({p,_,_} = K) ->
+                      ets:delete(?TAB, {K, Pid})
+              end, Revs),
+            ets:select_delete(?TAB, [{{{Pid,{'_',l,'_'}},'_'}, [], [true]}]),
+            ets:delete(?TAB, Marker),
+            ok
     end.
 
+do_give_away({T,l,_} = K, To, Pid) when T==n; T==a ->
+    Key = {K, T},
+    case ets:lookup(?TAB, Key) of
+        [{_, Pid, Value}] ->
+            %% Pid owns the reg; allowed to give_away
+            case pid_to_give_away_to(To) of
+                Pid ->
+                    %% Give away to ourselves? Why not? We'll allow it,
+                    %% but nothing needs to be done.
+                    Pid;
+                ToPid when is_pid(ToPid) ->
+                    ets:insert(?TAB, [{Key, ToPid, Value},
+                                      {{ToPid, K}, []}]),
+                    ets:delete(?TAB, {Pid, K}),
+                    _ = gproc_lib:ensure_monitor(ToPid, l),
+                    ToPid;
+                undefined ->
+                    _ = gproc_lib:remove_reg(K, Pid),
+                    undefined
+            end;
+        _ ->
+            badarg
+    end;
+do_give_away({T,l,_} = K, To, Pid) when T==c; T==p ->
+    Key = {K, Pid},
+    case ets:lookup(?TAB, Key) of
+        [{_, Pid, Value}] ->
+            case pid_to_give_away_to(To) of
+                ToPid when is_pid(ToPid) ->
+                    ToKey = {K, ToPid},
+                    case ets:member(?TAB, ToKey) of
+                        true ->
+                            badarg;
+                        false ->
+                            ets:insert(?TAB, [{ToKey, ToPid, Value},
+                                              {{ToPid, K}, []}]),
+                            ets:delete(?TAB, {Pid, K}),
+                            ets:delete(?TAB, Key),
+                            _ = gproc_lib:ensure_monitor(ToPid, l),
+                            ToPid
+                    end;
+                undefined ->
+                    _ = gproc_lib:remove_reg(K, Pid),
+                    undefined
+            end;
+        _ ->
+            badarg
+    end.
+
+
+pid_to_give_away_to(P) when is_pid(P), node(P) == node() ->
+    P;
+pid_to_give_away_to({T,l,_} = Key) when T==n; T==a ->
+    case ets:lookup(?TAB, {Key, T}) of
+        [{_, Pid, _}] ->
+            Pid;
+        _ ->
+            undefined
+    end.
+
+create_tabs() ->
+    Opts = gproc_lib:valid_opts(ets_options, [{write_concurrency,true},
+					      {read_concurrency, true}]),
+    case ets:info(?TAB, name) of
+        undefined ->
+            ets:new(?TAB, [ordered_set, public, named_table | Opts]);
+        _ ->
+            ok
+    end.
 
 %% @hidden
 init([]) ->
@@ -997,7 +1604,7 @@ set_monitors() ->
 set_monitors('$end_of_table') ->
     ok;
 set_monitors({Pids, Cont}) ->
-    [erlang:monitor(process,Pid) || Pid <- Pids],
+    _ = [erlang:monitor(process,Pid) || Pid <- Pids],
     set_monitors(ets:select(Cont)).
 
 
@@ -1023,11 +1630,11 @@ pattern([{{A,B,C},Gs,As}], Scope) ->
     [{HeadPat, rewrite(Gs,Vars), rewrite(As,Vars)}];
 pattern([{Head, Gs, As}], Scope) ->
     ?l,
+    {S, T} = get_s_t(Scope),
     case is_var(Head) of
         {true,_N} ->
-            HeadPat = {{{type(Scope),'_','_'},'_'},'_','_'},
+            HeadPat = {{{T,S,'_'},'_'},'_','_'},
             Vs = [{Head, obj_prod()}],
-%%            {HeadPat, Vs} = headpat(Scope, A,B,C),
             %% the headpat function should somehow verify that Head is
             %% consistent with Scope (or should we add a guard?)
             [{HeadPat, rewrite(Gs, Vs), rewrite(As, Vs)}];
@@ -1048,7 +1655,7 @@ obj_prod_l() ->
       {element,3,'$_'} ].
 
 
-headpat({S, T}, V1,V2,V3) when S==global; S==local; S==all ->
+headpat({S, T}, V1,V2,V3) ->
     headpat(type(T), scope(S), V1,V2,V3);
 headpat(T, V1, V2, V3) when is_atom(T) ->
     headpat(type(T), l, V1, V2, V3);
@@ -1083,7 +1690,7 @@ headpat(T, C, V1,V2,V3) ->
     {{{Kp,K2},V2,V3}, Vars}.
 
 %% l(L) -> L.
-    
+
 
 
 subst(X, '_', _F, Vs) ->
@@ -1096,10 +1703,13 @@ subst(X, V, F, Vs) ->
             {V, Vs}
     end.
 
+scope('_')    -> '_';
 scope(all)    -> '_';
 scope(global) -> g;
-scope(local)  -> l.
+scope(local)  -> l;
+scope(S) when S==l; S==g -> S.
 
+type('_')   -> '_';
 type(all)   -> '_';
 type(T) when T==n; T==p; T==c; T==a -> T;
 type(names) -> n;
@@ -1107,15 +1717,13 @@ type(props) -> p;
 type(counters) -> c;
 type(aggr_counters) -> a.
 
-keypat(Context) ->
+rev_keypat(Context) ->
     {S,T} = get_s_t(Context),
-    {{T,S,'_'},'_'}.
-
-
+    {T,S,'_'}.
 
 get_s_t({S,T}) -> {scope(S), type(T)};
 get_s_t(T) when is_atom(T) ->
-    {l, type(T)}.
+    {scope(all), type(T)}.
 
 is_var('$1') -> {true,1};
 is_var('$2') -> {true,2};
@@ -1128,7 +1736,7 @@ is_var('$8') -> {true,8};
 is_var('$9') -> {true,9};
 is_var(X) when is_atom(X) ->
     case atom_to_list(X) of
-        "$" ++ Tl ->
+        "\$" ++ Tl ->
             try N = list_to_integer(Tl),
                 {true,N}
             catch
@@ -1168,6 +1776,14 @@ rewrite1(Expr, _) ->
     Expr.
 
 
+%% @spec () -> any()
+%%
+%% @doc
+%% @equiv table({all, all})
+%% @end
+table() ->
+    table({all, all}).
+
 %% @spec (Context::context()) -> any()
 %%
 %% @doc
@@ -1183,7 +1799,8 @@ table(Context) ->
 %% Context specifies which subset of the registry should be queried.
 %% See [http://www.erlang.org/doc/man/qlc.html].
 %% @end
-table(Ctxt, Opts) ->
+table(Context, Opts) ->
+    Ctxt = {_, Type} = get_s_t(Context),
     [Traverse, NObjs] = [proplists:get_value(K,Opts,Def) ||
                             {K,Def} <- [{traverse,select}, {n_objects,100}]],
     TF = case Traverse of
@@ -1198,7 +1815,7 @@ table(Ctxt, Opts) ->
                  erlang:error(badarg, [Ctxt,Opts])
          end,
     InfoFun = fun(indices) -> [2];
-                 (is_unique_objects) -> is_unique(Ctxt);
+                 (is_unique_objects) -> is_unique(Type);
                  (keypos) -> 1;
                  (is_sorted_key) -> true;
                  (num_of_objects) ->
@@ -1225,10 +1842,10 @@ qlc_lookup(_Scope, 1, Keys) ->
 qlc_lookup(Scope, 2, Pids) ->
     lists:flatmap(fun(Pid) ->
                           Found =
-                              ets:select(?TAB, [{ {{Pid,keypat(Scope)}},
-                                                  [], ['$_']}]),
+                              ets:select(?TAB, [{{{Pid, rev_keypat(Scope)}, '_'},
+						 [], ['$_']}]),
                           lists:flatmap(
-                            fun({{_,{T,_,_}=K}}) ->
+                            fun({{_,{T,_,_}=K}, _}) ->
                                     K2 = if T==n orelse T==a -> T;
                                             true -> Pid
                                          end,
@@ -1266,123 +1883,6 @@ qlc_select({Objects, Cont}) ->
     Objects ++ fun() -> qlc_select(ets:select(Cont)) end.
 
 
-is_unique(names) -> true;
-is_unique(aggr_counters) -> true;
-is_unique({_, names}) -> true;
-is_unique({_, aggr_counters}) -> true;
 is_unique(n) -> true;
 is_unique(a) -> true;
-is_unique({_,n}) -> true;
-is_unique({_,a}) -> true;
 is_unique(_) -> false.
-
-
-%% =============== EUNIT tests
-
-reg_test_() ->
-    {setup,
-     fun() ->
-             application:start(gproc)
-     end,
-     fun(_) ->
-             application:stop(gproc)
-     end,
-     [
-      {spawn, ?_test(t_simple_reg())}
-      , ?_test(t_is_clean())
-      , {spawn, ?_test(t_simple_prop())}
-      , ?_test(t_is_clean())
-      , {spawn, ?_test(t_await())}
-      , ?_test(t_is_clean())
-      , {spawn, ?_test(t_simple_mreg())}
-      , ?_test(t_is_clean())
-      , {spawn, ?_test(t_gproc_crash())}
-      , ?_test(t_is_clean())
-     ]}.
-
-t_simple_reg() ->
-    ?assert(gproc:reg({n,l,name}) =:= true),
-    ?assert(gproc:where({n,l,name}) =:= self()),
-    ?assert(gproc:unreg({n,l,name}) =:= true),
-    ?assert(gproc:where({n,l,name}) =:= undefined).
-
-
-                       
-t_simple_prop() ->
-    ?assert(gproc:reg({p,l,prop}) =:= true),
-    ?assert(t_other_proc(fun() ->
-                                 ?assert(gproc:reg({p,l,prop}) =:= true)
-                         end) =:= ok),
-    ?assert(gproc:unreg({p,l,prop}) =:= true).
-
-t_other_proc(F) ->
-    {_Pid,Ref} = spawn_monitor(fun() -> exit(F()) end),
-    receive
-        {'DOWN',Ref,_,_,R} ->
-            R
-    after 10000 ->
-            erlang:error(timeout)
-    end.
-
-t_await() ->
-    Me = self(),
-    {_Pid,Ref} = spawn_monitor(
-                   fun() -> exit(?assert(gproc:await({n,l,t_await}) =:= {Me,val})) end),
-    ?assert(gproc:reg({n,l,t_await},val) =:= true),
-    receive
-        {'DOWN', Ref, _, _, R} ->
-            ?assertEqual(R, ok)
-    after 10000 ->
-            erlang:error(timeout)
-    end.
-
-t_is_clean() ->
-    sys:get_status(gproc), % in order to synch
-    T = ets:tab2list(gproc),
-    ?assert(T =:= []).
-                                        
-
-t_simple_mreg() ->
-    ok.
-
-
-t_gproc_crash() ->
-    P = spawn_helper(),
-    ?assert(gproc:where({n,l,P}) =:= P),
-    exit(whereis(gproc), kill),
-    give_gproc_some_time(100),
-    ?assert(whereis(gproc) =/= undefined),
-    %%
-    %% Check that the registration is still there using an ets:lookup(),
-    %% Once we've killed the process, gproc will always return undefined
-    %% if the process is not alive, regardless of whether the registration
-    %% is still there. So, here, the lookup should find something...
-    %%
-    ?assert(ets:lookup(gproc,{{n,l,P},n}) =/= []),
-    ?assert(gproc:where({n,l,P}) =:= P),
-    exit(P, kill),
-    %% ...and here, it shouldn't.
-    %% (sleep for a while first to let gproc handle the EXIT
-    give_gproc_some_time(10),
-    ?assert(ets:lookup(gproc,{{n,l,P},n}) =:= []).
-
-    
-spawn_helper() ->
-    Parent = self(),
-    P = spawn(fun() ->
-		      ?assert(gproc:reg({n,l,self()}) =:= true),
-		      Ref = erlang:monitor(process, Parent),
-		      Parent ! {ok,self()},
-		      receive 
-			  {'DOWN', Ref, _, _, _} ->
-			      ok
-		      end
-	      end),
-    receive
-	{ok,P} ->
-	     P
-    end.
-
-give_gproc_some_time(T) ->
-    timer:sleep(T),
-    sys:get_status(gproc).

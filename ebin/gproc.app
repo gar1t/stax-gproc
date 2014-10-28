@@ -1,20 +1,9 @@
-%%% -*- mode: erlang -*-
-%%% $Id$
-%%%
-
-{application, gproc,
- [
-  {description, "GPROC"},
-  {vsn, "0.1.0"},
-  {id, "GPROC"},
-  {modules, [gproc,
-            gproc_app,
-            gproc_dist,
-            gproc_init,
-            gproc_lib,
-            gproc_sup]},
-  {registered, [ ] },
-  {applications, [ kernel, stdlib ] },
-  {mod, {gproc_app, []} }
- ]
-}.
+{application,gproc,
+             [{description,"GPROC"},
+              {vsn,"4137f50"},
+              {id,"GPROC"},
+              {registered,[]},
+              {applications,[kernel,stdlib]},
+              {mod,{gproc_app,[]}},
+              {modules,[gproc,gproc_app,gproc_dist,gproc_info,gproc_init,
+                        gproc_lib,gproc_sup]}]}.
